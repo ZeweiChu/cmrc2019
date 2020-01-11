@@ -37,10 +37,11 @@ from torch.utils.data.distributed import DistributedSampler
 from torch import nn
 from torch.nn import CrossEntropyLoss
 
-from pytorch_pretrained_bert.tokenization import whitespace_tokenize, BasicTokenizer, BertTokenizer
-from pytorch_pretrained_bert.modeling import PreTrainedBertModel,BertModel,BertConfig
-from pytorch_pretrained_bert.optimization import BertAdam
-from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
+from transformers import BasicTokenizer, BertTokenizer
+from transformers.tokenization_bert import whitespace_tokenize
+from transformers import BertPreTrainedModel,BertModel,BertConfig
+from transformers import AdamW, get_linear_schedule_with_warmup
+from transformers import PYTORCH_PRETRAINED_BERT_CACHE
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt = '%m/%d/%Y %H:%M:%S',
@@ -48,16 +49,16 @@ logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(messa
 logger = logging.getLogger(__name__)
 
 #add mask in answer position
-class BertForQuestionAnswering(PreTrainedBertModel):
+class BertForQuestionAnswering(BertPreTrainedModel):
 
     def __init__(self, config):
         super(BertForQuestionAnswering, self).__init__(config)
         self.bert = BertModel(config)
         self.qa_outputs = nn.Linear(config.hidden_size, 1)
-        self.apply(self.init_bert_weights)
+        self.init_weights()
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, answer_mask=None,positions=None):
-        sequence_output, _ = self.bert(input_ids, token_type_ids, attention_mask, output_all_encoded_layers=False)
+        sequence_output, _ = self.bert(input_ids, token_type_ids, attention_mask)
         answer_mask = answer_mask.to(dtype=next(self.parameters()).dtype)
         logits = self.qa_outputs(sequence_output).squeeze(-1)
         #logits = logits*answer_mask_
@@ -109,6 +110,7 @@ class SquadExample(object):
 
 def read_squad_examples(input_data, is_training):
     """Read a SQuAD json file into a list of SquadExample."""
+    """读入数据，把每个instance都存入到SquadExample这个class当中去"""
     # with open(input_file, "r", encoding='utf-8') as reader:
     replace_list=[
         ['[BLANK1]','[unused1]'],
@@ -155,8 +157,9 @@ def read_squad_examples(input_data, is_training):
                 tmp_text+=word.strip()
         paragraph_text=tmp_text.strip()
         doc_tokens = []
-        char_to_word_offset = []
+        char_to_word_offset = [] # char_to_word_offset表示当前位置的character对应的是第几个单词
         prev_is_whitespace = True
+        # 这里只是简单地使用white space来拆分一下句子而已
         for c in paragraph_text:
             if is_whitespace(c):
                 prev_is_whitespace = True
@@ -176,10 +179,10 @@ def read_squad_examples(input_data, is_training):
                 #     tmp_answer_text+=word+" "
                 # answer_text=tmp_answer_text.strip()
                 orig_answer_text = answer_text
-                question_text = choices[choice_num]
-                answer_offset = paragraph_text.find(orig_answer_text)
+                question_text = choices[choice_num] # 我们把候选加入的语句作为问题
+                answer_offset = paragraph_text.find(orig_answer_text) # 寻找答案需要填充的位置
                 answer_length = len(orig_answer_text)
-                start_position = char_to_word_offset[answer_offset]
+                start_position = char_to_word_offset[answer_offset] # 答案的开始位置
                 end_position = char_to_word_offset[answer_offset + answer_length - 1]
                 # Only add answers where the text can be exactly recovered from the
                 # document. If this CAN'T happen it's likely due to weird Unicode
@@ -273,13 +276,15 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
     for (example_index, example) in enumerate(examples):
         query_tokens = tokenizer.tokenize(example.question_text)
 
+        # 只留下max length的问题
         if len(query_tokens) > max_query_length:
             query_tokens = query_tokens[0:max_query_length]
 
         tok_to_orig_index = []
         orig_to_tok_index = []
-        all_doc_tokens = []
+        all_doc_tokens = [] # 这些是分词之后的token
         for (i, token) in enumerate(example.doc_tokens):
+            # 注意之前的doc_tokens只是简单地使用white space来划分了一下，下面我们需要用BERT提供的BPE tokenizer来重新分割一下单词，所以才会有orig_to_tok_index
             orig_to_tok_index.append(len(all_doc_tokens))
             if token.find("unused")>-1:#  not Part-of-speech of [unused1-15]
                 sub_tokens=[str(token)]
@@ -291,7 +296,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
 
         tok_position = None
         if is_training:
-            tok_position = orig_to_tok_index[example.position]
+            tok_position = orig_to_tok_index[example.position] # 现在是分词之后答案所处的位置了
             #tok_position, _ = _improve_answer_span(
             #    all_doc_tokens, tok_position, tok_position, tokenizer,
             #    example.orig_answer_text)
@@ -302,6 +307,8 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
         # We can have documents that are longer than the maximum sequence length.
         # To deal with this we do a sliding window approach, where we take chunks
         # of the up to our max length with a stride of `doc_stride`.
+
+        # 超过一定长度的document我们需要处理掉
         _DocSpan = collections.namedtuple(  # pylint: disable=invalid-name
             "DocSpan", ["start", "length"])
         doc_spans = []
@@ -315,6 +322,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
                 break
             start_offset += min(length, doc_stride)
 
+        # 下面我们按照BERT的格式要求来构造inputs
         for (doc_span_index, doc_span) in enumerate(doc_spans):
             tokens = []
             token_to_orig_map = {}
@@ -322,12 +330,15 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
             segment_ids = []
             tokens.append("[CLS]")
             segment_ids.append(0)
+
+            # 首先是问题
             for token in query_tokens:
                 tokens.append(token)
                 segment_ids.append(0)
             tokens.append("[SEP]")
             segment_ids.append(0)
 
+            # 然后是document
             for i in range(doc_span.length):
                 split_token_index = doc_span.start + i
                 token_to_orig_map[len(tokens)] = tok_to_orig_index[split_token_index]
@@ -1031,10 +1042,12 @@ def main():
         else:
             optimizer = FP16_Optimizer(optimizer, static_loss_scale=args.loss_scale)
     else:
-        optimizer = BertAdam(optimizer_grouped_parameters,
-                             lr=args.learning_rate,
-                             warmup=args.warmup_proportion,
-                             t_total=t_total)
+        optimizer = AdamW(optimizer_grouped_parameters,
+                             lr=args.learning_rate)
+        warmup_steps = int(t_total * args.warmup_proportion)
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, num_warmup_steps=warmup_steps, num_training_steps=t_total
+        )
 
     global_step = 0
     if args.do_train:
@@ -1097,6 +1110,7 @@ def main():
                     for param_group in optimizer.param_groups:
                         param_group['lr'] = lr_this_step
                     optimizer.step()
+                    scheduler.step()
                     optimizer.zero_grad()
                     global_step += 1
 
